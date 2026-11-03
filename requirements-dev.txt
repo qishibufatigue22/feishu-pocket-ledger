@@ -1,0 +1,2 @@
+# Optional formatting tool; the bot uses only the Python standard library.
+black==24.8.0
