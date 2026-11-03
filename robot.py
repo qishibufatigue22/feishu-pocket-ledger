@@ -171,6 +171,32 @@ def parse_correction(text, today):
     return date, label, cents, category, old_cents
 
 
+def parse_removal(text, today):
+    """Recognize duplicate/withdrawal requests before amount corrections."""
+    if not re.search(r"重复|撤销|删除|取消.*(?:消费|账|一笔)", text):
+        return None
+    duplicate = "重复" in text
+    cleaned = re.sub(r"^(?:不对|记错了?)[，,：:\s]*", "", text.strip())
+    cleaned = re.sub(
+        r"^(?:请|帮我|把|将|撤销|删除|取消|一笔|一条|这笔)+\s*", "", cleaned
+    )
+    cleaned = re.sub(
+        r"(?:重复(?:记账|入账)?了?|撤销|删除|取消)(?:一笔|一条|这笔)?[。！!\s]*$",
+        "",
+        cleaned,
+    ).strip()
+    has_amount = bool(re.search(r"\d+(?:\.\d{1,2})?\s*(?:元|块)?$", cleaned))
+    try:
+        date, label, cents, _ = parse_expense(
+            cleaned if has_amount else cleaned + "0.01", today
+        )
+    except ValueError:
+        raise ValueError(
+            "请注明要撤销的消费，例如“10月24 iCloud重复了”或“撤销10月24 iCloud28”。"
+        ) from None
+    return date, label, cents if has_amount else None, duplicate
+
+
 def classify(text):
     text = text.casefold()
     explicit = [c for c in CATEGORIES if c in text]
@@ -256,6 +282,14 @@ class FeishuStore:
         temp.write_text(dumps(self.config), encoding="utf-8")
         os.chmod(temp, 0o600)
         temp.replace(self.path)
+
+    def is_completed(self, message_id):
+        return message_id in self.config.get("completed_messages", [])
+
+    def mark_completed(self, message_id):
+        if not self.is_completed(message_id):
+            self.config.setdefault("completed_messages", []).append(message_id)
+            self.save_config()
 
     def year(self, year):
         key, name = str(year), f"{year}年账本"
@@ -599,6 +633,8 @@ class Robot:
         message_id = event.get("message_id")
         if not message_id:
             return None
+        if self.store.is_completed(message_id):
+            return None
         text = event["content"].strip()
         today = dt.datetime.fromtimestamp(int(event["create_time"]) / 1000, TZ).date()
         if text in ("帮助", "help", "开始"):
@@ -648,10 +684,10 @@ class Robot:
                 )
             return f"{label}链接：\n{url}"
         create = re.fullmatch(
-            r"新建\s*(\d{4}|\d{2})年\s*(\d{1,2})月\s*账单(?:表格)?", text
+            r"新建\s*(?:(\d{4}|\d{2})年\s*)?(\d{1,2})月\s*账单(?:表格)?", text
         )
         if create:
-            year = int(create[1])
+            year = int(create[1]) if create[1] else today.year
             date = dt.date(year + 2000 if year < 100 else year, int(create[2]), 1)
             token, table = self.store.ensure_month(date)
             try:
@@ -664,11 +700,67 @@ class Robot:
             token, row = processed
             if row["状态"] == "待分类":
                 return self.question(row)
-            if row["状态"] in ("已入账", "已更正"):
+            if row["状态"] in ("已入账", "已更正", "撤销记录"):
                 date = dt.date.fromisoformat(row["日期"])
                 _, table = self.store.ensure_month(date)
                 self.store.sync_day(token, table, date)
             return "这条消息已处理，没有重复记账。"
+        removal = parse_removal(text, today)
+        if removal:
+            date, label, cents, duplicate = removal
+            token, posted = self.store.correction_candidates(date, self.owner)
+            candidates = [
+                r
+                for r in posted
+                if r["项目"].strip().casefold() == label.strip().casefold()
+            ]
+            if cents is not None:
+                candidates = [
+                    r
+                    for r in candidates
+                    if int(decimal.Decimal(str(r["金额"])) * 100) == cents
+                ]
+            amounts = {decimal.Decimal(str(r["金额"])) for r in candidates}
+            if not candidates or len(amounts) > 1:
+                return "没有唯一确定要扣除的消费，未调整账单。请注明日期、项目及金额，例如“撤销10月24 iCloud28”。"
+            if duplicate and len(candidates) < 2:
+                return f"{date} {label}目前只有一笔已入账记录，未再次扣减。如需删除它，请说“撤销{date} {label}{candidates[0]['金额']}”。"
+            row = max(candidates, key=lambda r: r["record_id"])
+            category = row["分类"]
+            originals = [r for r in posted if r["分类"] == category]
+            before = sum(
+                (decimal.Decimal(str(r["金额"])) for r in originals), decimal.Decimal(0)
+            )
+            amount = decimal.Decimal(str(row["金额"]))
+            _, table = self.store.ensure_month(date)
+            self.store.write(token, "消费明细", {"状态": "已撤销"}, row["record_id"])
+            self.store.write(
+                token,
+                "消费明细",
+                {
+                    "消息ID": message_id,
+                    "日期": date.isoformat(),
+                    "项目": f"撤销{row['项目']} ¥{amount:.2f}（{row['record_id']}）",
+                    "金额": float(amount),
+                    "分类": category,
+                    "大类": CATEGORIES[category],
+                    "状态": "撤销记录",
+                    "发送者": self.owner,
+                },
+            )
+            records = self.store.sync_day(token, table, date)
+            after = sum(
+                (
+                    decimal.Decimal(str(r["金额"]))
+                    for r in records
+                    if r["分类"] == category
+                ),
+                decimal.Decimal(0),
+            )
+            items = "；".join(
+                f"{r['项目']} ¥{decimal.Decimal(str(r['金额'])):.2f}" for r in originals
+            )
+            return f"已撤销一笔：{date} {row['项目']} ¥{amount:.2f}\n原有：{items}\n原有合计：¥{before:.2f}\n本次扣除：{row['项目']} ¥{amount:.2f}\n调整后（当天{category}）：¥{after:.2f}"
         correction = parse_correction(text, today)
         if correction:
             date, label, cents, category, old_cents = correction
@@ -755,7 +847,9 @@ class Robot:
             )
             records = self.store.sync_day(token, table, date)
             return self.posted_reply(date, dict(row, 分类=category), records)
-        date, label, cents, category = parse_expense(text, today)
+        repeated = re.match(r"^(?:再记一笔|再记|仍要新增)[：:\s]*", text)
+        expense_text = text[repeated.end() :] if repeated else text
+        date, label, cents, category = parse_expense(expense_text, today)
         token, table = self.store.ensure_month(date)
         existing = self.store.records(token, "消费明细", [["消息ID", "==", message_id]])
         if existing:
@@ -765,6 +859,24 @@ class Robot:
             if row["状态"] == "已入账":
                 self.store.sync_day(token, table, date)
             return "这条消息已处理，没有重复记账。"
+        if not repeated:
+            _, posted = self.store.correction_candidates(date, self.owner)
+            duplicates = [
+                r
+                for r in posted
+                if r["项目"].strip().casefold() == label.strip().casefold()
+                and int(decimal.Decimal(str(r["金额"])) * 100) == cents
+            ]
+            if duplicates:
+                category = duplicates[0]["分类"]
+                prior = [r for r in posted if r["分类"] == category]
+                items = "；".join(
+                    f"{r['项目']} ¥{decimal.Decimal(str(r['金额'])):.2f}" for r in prior
+                )
+                total = sum(
+                    (decimal.Decimal(str(r["金额"])) for r in prior), decimal.Decimal(0)
+                )
+                return f"疑似重复，未新增：{date} {label} ¥{cents / 100:.2f}\n原有：{items}\n原有合计：¥{total:.2f}\n本次新增：¥0.00\n当前（当天{category}）：¥{total:.2f}\n如果确实又消费了一笔，请发“再记一笔 {expense_text}”。"
         row = {
             "消息ID": message_id,
             "日期": date.isoformat(),
@@ -844,9 +956,12 @@ def run():
                         raise CLIError("飞书事件流未发出 ready 标记。")
                 try:
                     reply = robot.handle(event)
+                    completed = True
                 except ValueError as exc:
                     reply = str(exc)
+                    completed = True
                 except CLIError as exc:
+                    completed = False
                     logging.error("账单写入或汇总未完成，请检查飞书权限及表格。")
                     reply = (
                         str(exc) + "\n本次处理未全部完成，请检查消费明细后重试原消息。"
@@ -863,6 +978,8 @@ def run():
                         event["message_id"],
                         identity="bot",
                     )
+                    if completed:
+                        robot.store.mark_completed(event["message_id"])
             except (CLIError, ValueError, KeyError, subprocess.TimeoutExpired):
                 logging.exception("消息处理失败")
         code = child.wait()

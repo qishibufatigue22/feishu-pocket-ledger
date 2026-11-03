@@ -19,6 +19,13 @@ class FakeStore:
         self.months = {}
         self.totals = {}
         self.chart_years = []
+        self.completed = set()
+
+    def is_completed(self, message_id):
+        return message_id in self.completed
+
+    def mark_completed(self, message_id):
+        self.completed.add(message_id)
 
     def ensure_month(self, date):
         key = (date.year, date.month)
@@ -367,6 +374,59 @@ class Tests(unittest.TestCase):
         self.robot.handle(self.event("晚饭30"))
         self.assertEqual(len(self.store.rows), 2)
         self.assertEqual(list(self.store.totals.values()), [5000])
+
+    def test_delayed_duplicate_with_different_id_is_not_posted(self):
+        self.robot.handle(self.event("10月24 iCloud28"))
+        reply = self.robot.handle(self.event("10月24 iCloud28"))
+        self.assertIn("疑似重复，未新增", reply)
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertEqual(self.store.totals["2026-10-24"], 2800)
+        self.robot.handle(self.event("再记一笔 10月24 iCloud28"))
+        self.assertEqual(len(self.store.rows), 2)
+        self.assertEqual(self.store.totals["2026-10-24"], 5600)
+
+    def test_remove_duplicate_shows_before_and_after(self):
+        self.robot.handle(self.event("10月24 修正带4.73（零花钱）"))
+        self.robot.handle(self.event("10月24 iCloud28"))
+        self.robot.handle(self.event("再记一笔 10月24 iCloud28"))
+        event = self.event("不对 10月24 iCloud重复了")
+        reply = self.robot.handle(event)
+        self.assertIn("原有合计：¥60.73", reply)
+        self.assertIn("本次扣除：iCloud ¥28.00", reply)
+        self.assertIn("调整后（当天零花钱）：¥32.73", reply)
+        self.assertEqual(self.store.totals["2026-10-24"], 3273)
+        self.robot.handle(event)
+        self.assertEqual(self.store.totals["2026-10-24"], 3273)
+        reply = self.robot.handle(self.event("10月24 iCloud重复了"))
+        self.assertIn("只有一笔", reply)
+        self.assertEqual(self.store.totals["2026-10-24"], 3273)
+
+    def test_explicit_withdrawal_can_remove_single_expense(self):
+        self.robot.handle(self.event("10月24 iCloud28"))
+        reply = self.robot.handle(self.event("撤销10月24 iCloud28"))
+        self.assertIn("调整后（当天零花钱）：¥0.00", reply)
+        self.assertEqual(self.store.totals["2026-10-24"], 0)
+
+    def test_completed_commands_are_not_replied_to_again(self):
+        event = self.event("新建9月账单")
+        self.assertIn("2026年9月", self.robot.handle(event))
+        self.store.mark_completed(event["message_id"])
+        restarted = Robot(self.store, "ou_me")
+        self.assertIsNone(restarted.handle(event))
+        self.assertEqual(len(self.store.chart_years), 1)
+
+    def test_completed_message_ids_are_persisted(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            store = FeishuStore(None, {"years": {}}, path)
+            store.mark_completed("om_done")
+            import json
+
+            restarted = FeishuStore(None, json.loads(path.read_text()), path)
+            self.assertTrue(restarted.is_completed("om_done"))
 
     def test_aggregation_reply_shows_previous_and_new_expenses(self):
         self.robot.handle(self.event("10月21 高铁94"))
