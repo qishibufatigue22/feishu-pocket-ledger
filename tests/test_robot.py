@@ -428,6 +428,19 @@ class Tests(unittest.TestCase):
             restarted = FeishuStore(None, json.loads(path.read_text()), path)
             self.assertTrue(restarted.is_completed("om_done"))
 
+    def test_empty_text_normalized_to_null_is_confirmed(self):
+        store = FeishuStore(Mock(), {}, None)
+        store.records = Mock(return_value=[{
+            "record_id": "rec_pending", "消息ID": "om_pending",
+            "分类": None, "大类": None, "状态": "待分类",
+        }])
+        with patch("robot.time.sleep") as sleep:
+            store.write("token", "消费明细", {
+                "消息ID": "om_pending", "分类": "", "大类": "", "状态": "待分类",
+            })
+        sleep.assert_not_called()
+        self.assertIn("token", store.confirmed_details)
+
     def test_aggregation_reply_shows_previous_and_new_expenses(self):
         self.robot.handle(self.event("10月21 高铁94"))
         self.robot.handle(self.event("10月21 午饭20"))

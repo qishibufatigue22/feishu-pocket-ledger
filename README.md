@@ -66,6 +66,27 @@ python3 robot.py
 
 看到“飞书消息监听已就绪”后，在飞书里给机器人发送“帮助”。`Ctrl+C` 可正常停止程序。
 
+### macOS 常驻运行
+
+如果希望退出聊天或终端后机器人仍运行，可在完成配置后安装当前用户的登录启动服务：
+
+```sh
+python3 scripts/install_launch_agent.py
+```
+
+安装器把运行代码复制到 `~/Library/Application Support/feishu-pocket-ledger/`，避免后台服务依赖“文稿”目录的交互式访问权限；首次安装同时复制 `config.json`，以后更新保留该目录的配置与消息去重记录。运行目录权限为700，私有配置权限为600。
+
+服务在用户登录时启动，异常退出自动重启。更新仓库代码后再次运行安装器即可更新运行副本。安装后不要再手工启动项目目录里的另一份机器人，避免同一账本被两个实例处理。
+
+```sh
+launchctl print gui/$(id -u)/com.feishu-pocket-ledger.robot
+tail -f "$HOME/Library/Application Support/feishu-pocket-ledger/.logs/robot.stderr.log"
+```
+
+停用常驻服务：`launchctl bootout gui/$(id -u)/com.feishu-pocket-ledger.robot`。卸载时还需移除 `~/Library/LaunchAgents/com.feishu-pocket-ledger.robot.plist`；删除运行配置前请先备份。
+
+常驻服务不能让关机、休眠或断网的电脑继续接收消息。需要全天在线时仍应部署到持续联网的主机。
+
 ## 聊天示例
 
 | 目的 | 消息示例 |

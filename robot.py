@@ -436,7 +436,12 @@ class FeishuStore:
                     )
                 ]
                 if len(matches) == 1 and all(
-                    matches[0].get(k) == v for k, v in values.items()
+                    (
+                        matches[0].get(k) in (None, "")
+                        if v in (None, "")
+                        else matches[0].get(k) == v
+                    )
+                    for k, v in values.items()
                 ):
                     if table == "消费明细":
                         self.confirmed_details[token] = rows

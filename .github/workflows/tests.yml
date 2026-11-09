@@ -19,6 +19,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python sources
-        run: python -m compileall -q robot.py feishu_cli.py dashboard_setup.py tests
+        run: python -m compileall -q robot.py feishu_cli.py dashboard_setup.py tests scripts
       - name: Run tests without credentials
         run: python -m unittest discover -s tests -v
