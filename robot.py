@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 
 from feishu_cli import CLI, CLIError, decode_records, dumps, find_id, objects
 
+from natural_intent import expense_parts, query_intent
+
 TZ = ZoneInfo("Asia/Shanghai")
 CATEGORIES = {
     "房租/物业水电": "固定费",
@@ -41,6 +43,7 @@ WORDS = {
         "午餐",
         "晚餐",
         "买菜",
+        "咖啡",
         "外卖",
         "餐厅",
         "饭店",
@@ -627,7 +630,40 @@ class Robot:
                 reply += f"\n同日其他消费：{items}\n修改前汇总：¥{previous + before:.2f}\n修改后汇总（当天{category}）：¥{previous + amount:.2f}"
         return reply
 
-    def handle(self, event):
+    def spending_reply(self, query):
+        totals, days, count = {}, {}, 0
+        for year in range(query.start.year, query.end.year + 1):
+            token = self.store.config["years"].get(str(year))
+            if not token:
+                continue
+            for row in self.store.records(
+                token, "消费明细",
+                [["状态", "==", "已入账"], ["发送者", "==", self.owner]],
+            ):
+                date = dt.date.fromisoformat(row["日期"])
+                category = row["分类"]
+                if not query.start <= date <= query.end or (query.category and category != query.category):
+                    continue
+                amount = decimal.Decimal(str(row["金额"]))
+                totals[category] = totals.get(category, 0) + amount
+                days[date] = days.get(date, 0) + amount
+                count += 1
+        label = query.category or "支出"
+        result = f"{query.start} 至 {query.end}，{label}合计 ¥{sum(totals.values()):.2f}（{count}笔已入账）。"
+        if query.ranking and totals:
+            ranked = sorted(totals.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+            result += "\n" + "\n".join(f"{i}. {key} ¥{value:.2f}" for i, (key, value) in enumerate(ranked, 1))
+        if query.peak and days:
+            peak = max(days.values())
+            dates = "、".join(str(day) for day in sorted(days) if days[day] == peak)
+            result += f"\n支出最高：{dates}，¥{peak:.2f}。"
+        if (query.start.year, query.start.month) == (query.end.year, query.end.month):
+            url = self.store.get_bill_link(query.start.year, query.start.month)
+            if url:
+                result += f"\n账单：{url}"
+        return result
+
+    def handle(self, event, *, routed=False):
         if (
             event.get("sender_type") != "user"
             or event.get("sender_id") != self.owner
@@ -642,9 +678,31 @@ class Robot:
             return None
         text = event["content"].strip()
         today = dt.datetime.fromtimestamp(int(event["create_time"]) / 1000, TZ).date()
+        if not routed:
+            query = query_intent(text, today, CATEGORIES)
+            if query:
+                return self.spending_reply(query)
+            if re.search(r"[？?]|是不是|要不要|能不能|可以.*吗", text):
+                return "这句话像是在询问，未修改账单。要记账可以说“帮我记昨天打车36”。"
+            parts = expense_parts(text)
+            if parts:
+                parsed = [parse_expense(part, today) for part in parts]
+                if len(parts) > 1:
+                    if any(not entry[3] for entry in parsed):
+                        return "有项目的分类不明确，整批尚未入账。请在金额后注明分类，例如“咖啡22（伙食费）”。"
+                    if self.store.pending(self.owner):
+                        return "请先处理上一笔待分类消费，再发这批消费。"
+                    return "\n\n".join(
+                        self.handle(dict(event, content=part, message_id=f"{message_id}:{i}"), routed=True)
+                        for i, part in enumerate(parts, 1)
+                    )
+                text = parts[0]
+                routed = True
+            text = re.sub(r"^(?:请)?(?:帮我)?(?:把|将)?(今天|昨天|前天)\s*(?:的)?那笔\s*", r"\1 ", text)
+            text = re.sub(r"^(?:请)?帮我(把|将)(?=.+(?:改成|改为))", r"\1", text)
         if text in ("帮助", "help", "开始"):
             return HELP
-        if re.search(r"图表|仪表盘|饼图|柱状图|支出分析", text) and re.search(
+        if not routed and re.search(r"图表|仪表盘|饼图|柱状图|支出分析", text) and re.search(
             r"创建|新建|生成|补齐|更新|添加|做", text
         ):
             month_match = re.search(r"(?:(\d{4}|\d{2})年\s*)?(\d{1,2})月", text)
@@ -661,7 +719,7 @@ class Robot:
                 else f"{year}年已有月份"
             )
             return f"已为{prefix}补齐分类支出饼图、每日支出柱状图，并关联全年月度对比。已有图表会复用。\n{url}"
-        if ("链接" in text or re.search(r"查看|打开|发给我|给我", text)) and re.search(
+        if not routed and ("链接" in text or re.search(r"查看|打开|发给我|给我", text)) and re.search(
             r"账单|账本", text
         ):
             month_match = re.search(r"(?:(\d{4}|\d{2})年\s*)?(\d{1,2})月", text)
@@ -691,7 +749,7 @@ class Robot:
         create = re.fullmatch(
             r"新建\s*(?:(\d{4}|\d{2})年\s*)?(\d{1,2})月\s*账单(?:表格)?", text
         )
-        if create:
+        if create and not routed:
             year = int(create[1]) if create[1] else today.year
             date = dt.date(year + 2000 if year < 100 else year, int(create[2]), 1)
             token, table = self.store.ensure_month(date)
@@ -710,7 +768,7 @@ class Robot:
                 _, table = self.store.ensure_month(date)
                 self.store.sync_day(token, table, date)
             return "这条消息已处理，没有重复记账。"
-        removal = parse_removal(text, today)
+        removal = None if routed else parse_removal(text, today)
         if removal:
             date, label, cents, duplicate = removal
             token, posted = self.store.correction_candidates(date, self.owner)
@@ -766,17 +824,16 @@ class Robot:
                 f"{r['项目']} ¥{decimal.Decimal(str(r['金额'])):.2f}" for r in originals
             )
             return f"已撤销一笔：{date} {row['项目']} ¥{amount:.2f}\n原有：{items}\n原有合计：¥{before:.2f}\n本次扣除：{row['项目']} ¥{amount:.2f}\n调整后（当天{category}）：¥{after:.2f}"
-        correction = parse_correction(text, today)
+        correction = None if routed else parse_correction(text, today)
         if correction:
             date, label, cents, category, old_cents = correction
             token, candidates = self.store.correction_candidates(date, self.owner)
             if label not in ("上一笔", "刚才那笔", "刚才的", "金额"):
-                exact = [r for r in candidates if r["项目"] == label]
-                candidates = (
-                    exact
-                    if exact
-                    else [r for r in candidates if category and r["分类"] == category]
-                )
+                candidates = [
+                    r for r in candidates
+                    if r["项目"].casefold() == label.casefold()
+                    or (label in CATEGORIES and r["分类"] == label)
+                ]
             if old_cents is not None:
                 candidates = [
                     r

@@ -20,6 +20,7 @@ class FakeStore:
         self.totals = {}
         self.chart_years = []
         self.completed = set()
+        self.config = {"years": {}}
 
     def is_completed(self, message_id):
         return message_id in self.completed
@@ -28,6 +29,7 @@ class FakeStore:
         self.completed.add(message_id)
 
     def ensure_month(self, date):
+        self.config["years"][str(date.year)] = str(date.year)
         key = (date.year, date.month)
         self.months.setdefault(key, (str(date.year), str(date.month)))
         return self.months[key]
@@ -110,6 +112,47 @@ class Tests(unittest.TestCase):
             "content": text,
             "create_time": "1793610000000",
         }
+
+    def test_natural_batch_uses_shared_date_and_stable_ids(self):
+        event = self.event("昨天打车36，咖啡22，帮我记一下。")
+        result = self.robot.handle(event)
+        self.assertIn("已记账", result)
+        self.assertEqual(
+            [(row["日期"], row["项目"], row["金额"]) for row in self.store.rows],
+            [("2026-11-01", "打车", 36), ("2026-11-01", "咖啡", 22)],
+        )
+        self.robot.handle(event)
+        self.assertEqual(len(self.store.rows), 2)
+
+    def test_natural_query_uses_only_own_posted_records(self):
+        self.robot.handle(self.event("10月28午饭22"))
+        self.robot.handle(self.event("10月29午饭30"))
+        self.robot.handle(self.event("10月29打车50"))
+        self.store.rows += [
+            dict(self.store.rows[0], 状态="已撤销", 金额=500),
+            dict(self.store.rows[0], 发送者="ou_other", 金额=999),
+        ]
+        result = self.robot.handle(self.event("上周吃饭花了多少？哪天最多？"))
+        self.assertIn("¥52.00", result)
+        self.assertIn("2026-10-29，¥30.00", result)
+        self.assertEqual(len(self.store.rows), 5)
+
+    def test_natural_correction_does_not_change_other_transport(self):
+        self.robot.handle(self.event("昨天公交3"))
+        result = self.robot.handle(self.event("昨天那笔打车改成32"))
+        self.assertIn("没有唯一确定", result)
+        self.assertEqual(self.store.rows[0]["金额"], 3)
+        self.robot.handle(self.event("昨天打车36"))
+        result = self.robot.handle(self.event("昨天那笔打车改成32"))
+        self.assertIn("已修改", result)
+        self.assertEqual(self.store.rows[1]["金额"], 32)
+
+    def test_natural_batch_validates_before_writing(self):
+        result = self.robot.handle(self.event("帮我记昨天打车36，盒马22"))
+        self.assertIn("尚未入账", result)
+        result = self.robot.handle(self.event("昨天打车36可以记吗？"))
+        self.assertIn("未修改账单", result)
+        self.assertFalse(self.store.rows)
 
     def test_implicit_date_and_decimal(self):
         self.assertEqual(

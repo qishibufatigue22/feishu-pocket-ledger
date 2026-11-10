@@ -6,6 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 
 LABEL = "com.feishu-pocket-ledger.robot"
 
@@ -25,8 +26,15 @@ def install():
     runtime.mkdir(parents=True, exist_ok=True)
     runtime.chmod(0o700)
     domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", domain + "/" + LABEL], capture_output=True)
-    for name in ("robot.py", "feishu_cli.py", "dashboard_setup.py"):
+    service = domain + "/" + LABEL
+    subprocess.run(["launchctl", "bootout", service], capture_output=True)
+    # The old service may remain registered briefly after bootout returns.
+    deadline = time.monotonic() + 10
+    while subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0:
+        if time.monotonic() >= deadline:
+            raise SystemExit("旧服务尚未卸载，请稍后重试。")
+        time.sleep(0.25)
+    for name in ("robot.py", "feishu_cli.py", "dashboard_setup.py", "natural_intent.py"):
         shutil.copy2(root / name, runtime / name)
     config = runtime / "config.json"
     if not config.exists():
