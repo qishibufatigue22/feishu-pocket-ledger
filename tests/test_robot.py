@@ -219,7 +219,7 @@ class Tests(unittest.TestCase):
             "状态": "已入账",
         }
         store.records = Mock(side_effect=[[old], [old, new]])
-        with patch("robot.time.sleep") as sleep:
+        with patch("storage.feishu.time.sleep") as sleep:
             store.write(
                 "token", "消费明细", {k: v for k, v in new.items() if k != "record_id"}
             )
@@ -477,7 +477,7 @@ class Tests(unittest.TestCase):
             "record_id": "rec_pending", "消息ID": "om_pending",
             "分类": None, "大类": None, "状态": "待分类",
         }])
-        with patch("robot.time.sleep") as sleep:
+        with patch("storage.feishu.time.sleep") as sleep:
             store.write("token", "消费明细", {
                 "消息ID": "om_pending", "分类": "", "大类": "", "状态": "待分类",
             })

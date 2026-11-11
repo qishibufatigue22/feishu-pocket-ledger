@@ -36,6 +36,9 @@ def install():
         time.sleep(0.25)
     for name in ("robot.py", "feishu_cli.py", "dashboard_setup.py", "natural_intent.py"):
         shutil.copy2(root / name, runtime / name)
+    for package in ("agent", "tools", "knowledge", "storage", "adapters"):
+        shutil.copytree(root / package, runtime / package, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     config = runtime / "config.json"
     if not config.exists():
         shutil.copy2(root / "config.json", config)
